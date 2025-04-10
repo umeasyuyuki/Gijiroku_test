@@ -7,7 +7,7 @@ import shutil
 import json
 import requests
 import uvicorn
-from openai import OpenAI  # OpenAIライブラリのimport
+from openai import OpenAI  # OpenAIライブラリのimportだぜ
 
 load_dotenv()
 
