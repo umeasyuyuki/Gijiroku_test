@@ -1,15 +1,79 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import Tree from 'react-d3-tree';
-import { ReactMediaRecorder } from 'react-media-recorder';
+
+// ======== MUIコンポーネント & フレームワーク =========
+import {
+  AppBar,
+  Toolbar,
+  Typography,
+  Button,
+  Drawer,
+  List,
+  ListItemButton,
+  ListItemText,
+  Box,
+  Paper,
+  TextField,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogContentText,
+  DialogActions,
+  CircularProgress,
+  IconButton
+} from '@mui/material';
+import { createTheme, ThemeProvider } from '@mui/material/styles';
+
+// ======== Framer Motion for Animations =========
+import { motion, AnimatePresence } from 'framer-motion';
+
+// ======== アイコン =========
+import ContentCopyIcon from '@mui/icons-material/ContentCopy';
+import CloseIcon from '@mui/icons-material/Close';
+
+/**
+ * テーマを作成（都会的なブルー×ホワイト＋やや近未来感）
+ */
+const theme = createTheme({
+  palette: {
+    primary: {
+      main: '#1976d2', // MaterialUI既定のブルー
+    },
+    secondary: {
+      main: '#00f2fe', // 近未来ぽいライトブルー
+    },
+  },
+  typography: {
+    fontFamily: [
+      'Montserrat',
+      'Playfair Display',
+      'Roboto',
+      '"Helvetica Neue"',
+      'Arial',
+      'sans-serif',
+    ].join(','),
+  },
+});
+
+/**
+ * アニメーション用のバリアント例
+ */
+const fadeInVariants = {
+  hidden: { opacity: 0, y: -10 },
+  visible: { opacity: 1, y: 0, transition: { duration: 0.5 } },
+};
+const popInVariants = {
+  hidden: { opacity: 0, scale: 0.9 },
+  visible: { opacity: 1, scale: 1, transition: { duration: 0.4 } },
+};
 
 function App() {
-  // ローカル用APIエンドポイントの定義
   const API_URL = "http://localhost:8000";
 
   // --------------------------
-  // ステート定義
+  // ステート類（議事録作成部分）
   // --------------------------
-  const [notes, setNotes] = useState('ここに整形された文字起こしが表示されます');
+  const [notes, setNotes] = useState('ここに文字起こしが表示されます');
   const [summary, setSummary] = useState('ここに議事録・改善案が表示されます');
   const [mindmapData, setMindmapData] = useState(null);
   const [title, setTitle] = useState('');
@@ -17,24 +81,40 @@ function App() {
   const [recording, setRecording] = useState(false);
   const [recorded, setRecorded] = useState(false);
   const [showSaveModal, setShowSaveModal] = useState(false);
-
   const [loading, setLoading] = useState(false);
   const [saveStatus, setSaveStatus] = useState(null);
 
   const [savedMinutes, setSavedMinutes] = useState([]);
   const [selectedMinute, setSelectedMinute] = useState(null);
-
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
+  // 録音関連
+  const mediaRecorderRef = useRef(null);
+  const [audioChunks, setAudioChunks] = useState([]);
+  const [recordingTimerId, setRecordingTimerId] = useState(null);
+  const [recordingDuration, setRecordingDuration] = useState(0);
+  const durationIntervalRef = useRef(null);
+
   // --------------------------
-  // APIから保存済み議事録を取得
+  // モード: audio | text | chat
+  // --------------------------
+  const [mode, setMode] = useState("audio");
+  const [inputTranscript, setInputTranscript] = useState("");
+
+  // --------------------------
+  // チャットモード用
+  // --------------------------
+  const [chatMessages, setChatMessages] = useState([]); // { sender:'user'|'bot', text:''}[]
+  const [chatInput, setChatInput] = useState("");
+
+  // --------------------------
+  // 1) 保存済み議事録を取得
   // --------------------------
   const fetchSavedMinutes = async () => {
     try {
       const res = await fetch(`${API_URL}/get-minutes`);
       if (!res.ok) throw new Error('保存された議事録の取得に失敗しました');
       const data = await res.json();
-      // 直近のものが上になるようソート（id降順）
       const sorted = data.minutes.sort((a, b) => b.id - a.id);
       setSavedMinutes(sorted);
     } catch (error) {
@@ -46,36 +126,197 @@ function App() {
     fetchSavedMinutes();
   }, []);
 
-  // --------------------------
-  // 録音データをサーバーに送信して生成結果を取得
-  // --------------------------
-  const sendAudioToServer = async (audioBlob) => {
-    const formData = new FormData();
-    formData.append('audio', audioBlob, 'recording.mp3');
+  /**
+   * ブラウザがサポートする録音mimeTypeを順に探す
+   */
+  function getSupportedMimeType() {
+    const possibleTypes = [
+      "audio/webm;codecs=opus",
+      "audio/ogg;codecs=opus",
+      "audio/webm",
+      "audio/ogg"
+    ];
+    for (const t of possibleTypes) {
+      if (MediaRecorder.isTypeSupported(t)) {
+        return t;
+      }
+    }
+    return "";
+  }
+
+  // ====================================================
+  // 録音開始（フォールバックで対応フォーマットを選ぶ）
+  // ====================================================
+  const startRecording = async () => {
+    setRecording(true);
+    setRecorded(false);
+    setAudioChunks([]);
+    setRecordingDuration(0);
+    setNotes('録音が開始されました');
+    setSummary('会議中...');
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType = getSupportedMimeType();
+      if (!mimeType) {
+        throw new Error("ブラウザがサポートする録音フォーマットがありません。");
+      }
+
+      const mediaRecorder = new MediaRecorder(stream, { mimeType });
+
+      let localChunks = [];
+      mediaRecorder.addEventListener("dataavailable", (e) => {
+        if (e.data.size > 0) {
+          localChunks.push(e.data);
+        }
+      });
+
+      mediaRecorder.addEventListener("stop", () => {
+        // 取得したmimeTypeから拡張子を推定
+        let fileExt = mimeType.includes("ogg") ? "ogg" : "webm";
+        const blob = new Blob(localChunks, { type: mimeType });
+        // Fileにして名前をつけておく
+        const file = new File([blob], `recording_part.${fileExt}`, { type: mimeType });
+        setAudioChunks(prev => [...prev, file]);
+        localChunks = [];
+      });
+
+      mediaRecorderRef.current = mediaRecorder;
+      mediaRecorder.start();
+
+      // 10分ごとに stop -> start
+      const chunkInterval = setInterval(() => {
+        if (mediaRecorder.state === "recording") {
+          mediaRecorder.stop();
+        }
+        let newLocalChunks = [];
+        mediaRecorder.addEventListener("dataavailable", e => {
+          if (e.data.size > 0) {
+            newLocalChunks.push(e.data);
+          }
+        });
+        mediaRecorder.addEventListener("stop", () => {
+          let fileExt = mimeType.includes("ogg") ? "ogg" : "webm";
+          const newBlob = new Blob(newLocalChunks, { type: mimeType });
+          const file = new File([newBlob], `recording_part.${fileExt}`, { type: mimeType });
+          setAudioChunks(prev => [...prev, file]);
+        });
+        mediaRecorder.start();
+      }, 600000);
+
+      setRecordingTimerId(chunkInterval);
+
+      // 経過時間カウンタ
+      const timer = setInterval(() => {
+        setRecordingDuration(prev => prev + 1);
+      }, 1000);
+      durationIntervalRef.current = timer;
+
+    } catch (err) {
+      console.error('録音開始失敗:', err);
+      setNotes('録音開始に失敗しました: ' + err.message);
+      setRecording(false);
+    }
+  };
+
+  // ====================================================
+  // 録音停止 & 自動議事録作成
+  // ====================================================
+  const stopRecording = async () => {
+    setRecording(false);
+    setRecorded(true);
+
+    if (recordingTimerId) {
+      clearInterval(recordingTimerId);
+      setRecordingTimerId(null);
+    }
+    if (durationIntervalRef.current) {
+      clearInterval(durationIntervalRef.current);
+      durationIntervalRef.current = null;
+    }
+
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
+      mediaRecorderRef.current.stop();
+    }
+
+    setNotes('録音が停止しました。文字起こしを準備中...');
+
+    setTimeout(() => {
+      sendChunksToServer();
+    }, 500);
+  };
+
+  // ====================================================
+  // 複数チャンク送信 → 議事録生成
+  // ====================================================
+  const sendChunksToServer = async () => {
+    if (!audioChunks || audioChunks.length === 0) {
+      console.warn('音声チャンクがありません');
+      return;
+    }
     try {
       setLoading(true);
-      const res = await fetch(`${API_URL}/transcribe`, {
+      const formData = new FormData();
+      audioChunks.forEach((file, index) => {
+        formData.append('audios', file, file.name || `recording_part_${index}.webm`);
+      });
+
+      const res = await fetch(`${API_URL}/transcribe-chunks`, {
         method: 'POST',
         body: formData,
       });
       if (!res.ok) throw new Error(`サーバーエラー: ${res.statusText}`);
+
       const data = await res.json();
-      // 取得結果は編集可能な状態で各ステートにセット
       setNotes(data.formatted_transcript);
       setSummary(data.analysis);
       setMindmapData(data.mindmap);
-      setTitle(data.title); // GPTが生成したタイトル
+      setTitle(data.title);
+
+      setAudioChunks([]);
     } catch (error) {
       console.error('通信エラー:', error);
-      setNotes('通信エラーが発生しました');
+      setNotes('通信エラーが発生しました（ファイルサイズ制限などの可能性あり）');
     } finally {
       setLoading(false);
     }
   };
 
-  // --------------------------
+  // ====================================================
+  // テキストモード: 議事録作成
+  // ====================================================
+  const sendTextToServer = async () => {
+    if (!inputTranscript.trim()) {
+      alert("テキストが空です。");
+      return;
+    }
+    try {
+      setLoading(true);
+      const res = await fetch(`${API_URL}/transcribe-text`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ raw_text: inputTranscript }),
+      });
+      if (!res.ok) throw new Error(`サーバーエラー: ${res.statusText}`);
+
+      const data = await res.json();
+      setNotes(data.formatted_transcript);
+      setSummary(data.analysis);
+      setMindmapData(data.mindmap);
+      setTitle(data.title);
+
+      setRecorded(true);
+    } catch (err) {
+      console.error('テキストモード失敗:', err);
+      setNotes('テキスト議事録の生成中にエラーが発生しました。');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // ====================================================
   // 議事録保存
-  // --------------------------
+  // ====================================================
   const saveToDatabase = async () => {
     try {
       const res = await fetch(`${API_URL}/save-minutes`, {
@@ -95,560 +336,728 @@ function App() {
       const result = await res.json();
       if (result.status === 'success') {
         setSaveStatus('保存が完了しました！');
-        // 保存成功後は自動的にモーダルを閉じ、保存済み一覧を更新
         setShowSaveModal(false);
         fetchSavedMinutes();
       } else {
         setSaveStatus('保存に失敗しました: ' + (result.detail || ''));
       }
     } catch (err) {
-      console.error(err);
+      console.error('保存失敗:', err);
       setSaveStatus(err.message || '保存中にエラーが発生しました');
     }
   };
 
+  // ====================================================
+  // 議事録削除
+  // ====================================================
+  const deleteMinutes = async (id) => {
+    if (!window.confirm("本当に削除しますか？")) return;
+    try {
+      const res = await fetch(`${API_URL}/delete-minutes/${id}`, {
+        method: 'DELETE',
+      });
+      if (!res.ok) {
+        const errorText = await res.text();
+        throw new Error(`削除に失敗しました: ${errorText}`);
+      }
+      const result = await res.json();
+      if (result.status === 'success') {
+        alert('削除しました');
+        fetchSavedMinutes();
+        if (selectedMinute && selectedMinute.id === id) {
+          setSelectedMinute(null);
+        }
+      } else {
+        alert('削除に失敗: ' + result.detail);
+      }
+    } catch (err) {
+      console.error('削除エラー:', err);
+      alert('削除中にエラーが発生しました');
+    }
+  };
+
+  // ====================================================
+  // コピー機能
+  // ====================================================
+  const handleCopyContent = async (content) => {
+    try {
+      await navigator.clipboard.writeText(content);
+      alert('コピーしました!');
+    } catch (err) {
+      console.error('コピー失敗:', err);
+      alert('コピーに失敗しました');
+    }
+  };
+
+  // ====================================================
+  // チャットモード: 質問送信
+  // ====================================================
+  const sendChatMessage = async () => {
+    if (!chatInput.trim()) return;
+    // ユーザーメッセージを追加
+    const userMsg = { sender: 'user', text: chatInput };
+    setChatMessages((prev) => [...prev, userMsg]);
+    setChatInput("");
+
+    try {
+      const res = await fetch(`${API_URL}/chatbot`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: userMsg.text }),
+      });
+      if (!res.ok) {
+        throw new Error(`サーバーエラー: ${res.statusText}`);
+      }
+      const data = await res.json();
+      const botMsg = { sender: 'bot', text: data.response };
+      setChatMessages((prev) => [...prev, botMsg]);
+    } catch (err) {
+      console.error("チャットbotエラー:", err);
+      const botMsg = { sender: 'bot', text: "エラーが発生しました。" };
+      setChatMessages((prev) => [...prev, botMsg]);
+    }
+  };
+
   // --------------------------
-  // モーダル閉じる
+  // モーダル & サイドバー
   // --------------------------
   const closeSaveModal = () => {
     setSaveStatus(null);
   };
-
-  // --------------------------
-  // サイドバーの開閉
-  // --------------------------
   const toggleSidebar = () => {
     setSidebarOpen(!sidebarOpen);
   };
 
   return (
-    <div style={styles.appContainer}>
-      {/* キーアニメーション定義 */}
-      <style>{`
-        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-        @keyframes slideDown { from { transform: translateY(-20px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
-        @keyframes popIn { from { transform: scale(0.9); opacity: 0; } to { transform: scale(1); opacity: 1; } }
-      `}</style>
+    <ThemeProvider theme={theme}>
+      <Box
+        sx={{
+          minHeight: '100vh',
+          background: 'linear-gradient(to bottom right, #f0f9ff, #cfe9ff, #eef6ff)',
+          position: 'relative',
+        }}
+      >
+        {/* サイドバー閉開ボタン */}
+        <Button
+          variant="contained"
+          color="primary"
+          onClick={toggleSidebar}
+          sx={{
+            position: 'absolute',
+            left: 10,
+            top: 20,
+            borderRadius: '50%',
+            width: 45,
+            minWidth: 45,
+            height: 45,
+            fontSize: '1rem',
+            zIndex: 2000,
+          }}
+        >
+          {sidebarOpen ? '←' : '→'}
+        </Button>
 
-      {/* ヘッダー */}
-      <header style={styles.header}>
-        <div style={styles.headerLeft}>
-          <button style={styles.toggleButton} onClick={toggleSidebar}>
-            {sidebarOpen ? '←' : '→'}
-          </button>
-          <h1 style={styles.logo}>Conect AI</h1>
-        </div>
-        <div style={styles.headerRight}>
-          {/* 必要に応じてナビゲーションボタンなど */}
-        </div>
-      </header>
+        {/* ヘッダー */}
+        <AppBar position="sticky" sx={{ bgcolor: 'rgba(255, 255, 255, 0.8)', backdropFilter: 'blur(8px)' }}>
+          <Toolbar sx={{ justifyContent: 'center' }}>
+            <Typography variant="h4" sx={{ color: 'primary.main', fontWeight: 'bold' }}>
+              Conect AI
+            </Typography>
+          </Toolbar>
+        </AppBar>
 
-      {/* メインレイアウト */}
-      <div style={styles.contentWrapper}>
         {/* サイドバー */}
-        {sidebarOpen && (
-          <aside style={styles.sidebar}>
-            <h2 style={styles.sidebarTitle}>保存した議事録</h2>
-            {savedMinutes.length > 0 ? (
-              savedMinutes.map((minute) => (
-                <div
-                  key={minute.id}
-                  style={styles.sidebarItem}
-                  onClick={() => {
-                    setSelectedMinute(minute);
-                    setShowSaveModal(false);
+        <Drawer
+          variant="persistent"
+          anchor="left"
+          open={sidebarOpen}
+          sx={{
+            '& .MuiDrawer-paper': {
+              width: 240,
+              boxSizing: 'border-box',
+              borderRight: '1px solid #eee',
+              bgcolor: 'rgba(255,255,255,0.85)',
+              backdropFilter: 'blur(6px)',
+              pt: 8,
+            },
+          }}
+        >
+          <Box sx={{ p: 2 }}>
+            <Typography variant="subtitle1" sx={{ mb: 1, fontWeight: 'bold', color: '#1976d2' }}>
+              保存した議事録
+            </Typography>
+            <List>
+              {savedMinutes.length > 0 ? (
+                savedMinutes.map((minute) => (
+                  <ListItemButton
+                    key={minute.id}
+                    onClick={() => {
+                      setSelectedMinute(minute);
+                      setShowSaveModal(false);
+                    }}
+                  >
+                    <ListItemText primary={minute.title} />
+                  </ListItemButton>
+                ))
+              ) : (
+                <ListItemButton>
+                  <ListItemText primary="保存された議事録はありません" />
+                </ListItemButton>
+              )}
+            </List>
+          </Box>
+        </Drawer>
+
+        {/* メイン表示 */}
+        <Box
+          sx={{
+            ml: sidebarOpen ? '240px' : 2,
+            p: 3,
+            pt: 10,
+            transition: 'margin-left 0.3s ease',
+          }}
+        >
+          {/* モード切り替え */}
+          <Box sx={{ display: 'flex', justifyContent: 'center', gap: 2, mb: 3 }}>
+            <Button
+              variant={mode === 'audio' ? 'contained' : 'outlined'}
+              sx={{ borderRadius: 3, px: 4, py: 1, fontWeight: 'bold' }}
+              onClick={() => setMode('audio')}
+            >
+              音声モード
+            </Button>
+            <Button
+              variant={mode === 'text' ? 'contained' : 'outlined'}
+              sx={{ borderRadius: 3, px: 4, py: 1, fontWeight: 'bold' }}
+              onClick={() => setMode('text')}
+            >
+              テキストモード
+            </Button>
+            <Button
+              variant={mode === 'chat' ? 'contained' : 'outlined'}
+              sx={{ borderRadius: 3, px: 4, py: 1, fontWeight: 'bold' }}
+              onClick={() => setMode('chat')}
+            >
+              チャットモード
+            </Button>
+          </Box>
+
+          <AnimatePresence>
+            {selectedMinute ? (
+              // 議事録詳細表示
+              <motion.div
+                key="detailView"
+                variants={fadeInVariants}
+                initial="hidden"
+                animate="visible"
+                exit={{ opacity: 0 }}
+                style={{ position: 'relative' }}
+              >
+                <Button
+                  variant="contained"
+                  onClick={() => setSelectedMinute(null)}
+                  sx={{
+                    position: 'absolute',
+                    left: 10,
+                    top: 10,
+                    borderRadius: 3,
+                    px: 4,
+                    py: 1,
+                    fontWeight: 'bold',
+                    zIndex: 1000,
                   }}
                 >
-                  {minute.title}
-                </div>
-              ))
-            ) : (
-              <p style={styles.sidebarText}>保存された議事録はありません</p>
-            )}
-          </aside>
-        )}
+                  戻る
+                </Button>
 
-        {/* メインコンテンツ */}
-        <main style={{ ...styles.mainContent, marginLeft: sidebarOpen ? 300 : 20 }}>
-          {selectedMinute ? (
-            // 保存済み議事録詳細表示
-            <div style={styles.detailContainer}>
-              <button style={styles.backButton} onClick={() => setSelectedMinute(null)}>
-                戻る
-              </button>
-              <h2 style={styles.detailTitle}>{selectedMinute.title}</h2>
-              <div style={styles.card}>
-                <h3 style={styles.cardTitle}>整形された文字起こし</h3>
-                <p style={styles.cardContent}>{selectedMinute.formatted_transcript}</p>
-              </div>
-              <div style={styles.card}>
-                <h3 style={styles.cardTitle}>議事録・改善案</h3>
-                <p style={styles.cardContent}>{selectedMinute.analysis}</p>
-              </div>
-              {selectedMinute.mindmap && (
-                <div style={styles.mindmapContainer}>
-                  <Tree
-                    data={selectedMinute.mindmap}
-                    orientation="vertical"
-                    translate={{ x: 400, y: 50 }}
-                    pathFunc="diagonal"
-                    separation={{ siblings: 1.5, nonSiblings: 2 }}
-                    nodeSize={{ x: 300, y: 100 }}
-                  />
-                </div>
-              )}
-            </div>
-          ) : (
-            // 新規録音＆生成結果表示＋編集可能な入力欄
-            <div style={styles.recorderContainer}>
-              <div style={styles.descriptionBox}>
-                <p style={styles.descriptionText}>
-                  このアプリでは、会議の録音、文字起こし、議事録・改善案生成、そしてマインドマップ作成が可能です。<br />
-                  「録音開始」ボタンを押して会議内容を録音し、録音停止後に自動生成された議事録が下に表示されます。<br />
-                  ※表示された内容は、必要に応じて編集できます。
-                </p>
-              </div>
-              <ReactMediaRecorder
-                audio
-                video={false}
-                mimeType="audio/webm;codecs=opus"
-                onStop={(blobUrl, blob) => {
-                  sendAudioToServer(blob);
-                }}
-                render={({ status, startRecording, stopRecording }) => (
-                  <div style={styles.controlsWrapper}>
-                    {!recording ? (
-                      <button
-                        style={styles.actionButton}
-                        onClick={() => {
-                          startRecording();
-                          setRecording(true);
-                          setRecorded(false);
-                        }}
-                      >
-                        録音開始
-                      </button>
-                    ) : (
-                      <button
-                        style={styles.actionButton}
-                        onClick={() => {
-                          stopRecording();
-                          setRecording(false);
-                          setRecorded(true);
-                        }}
-                      >
-                        録音停止
-                      </button>
-                    )}
-                  </div>
-                )}
-              />
-              {recorded && (
-                <div style={styles.generatedContainer}>
-                  <div style={styles.generatedContent}>
-                    <h2>生成された議事録（編集可能）</h2>
-                    <div style={{ marginBottom: '10px' }}>
-                      <label>タイトル: </label>
-                      <input
-                        type="text"
-                        value={title}
-                        onChange={(e) => setTitle(e.target.value)}
-                        style={styles.editableTitle}
-                      />
-                    </div>
-                    <div style={{ marginBottom: '10px' }}>
-                      <label>整形された文字起こし: </label>
-                      <textarea
-                        value={notes}
-                        onChange={(e) => setNotes(e.target.value)}
-                        style={styles.editableTextarea}
-                      />
-                    </div>
-                    <div style={{ marginBottom: '10px' }}>
-                      <label>議事録・改善案: </label>
-                      <textarea
-                        value={summary}
-                        onChange={(e) => setSummary(e.target.value)}
-                        style={styles.editableTextarea}
-                      />
-                    </div>
-                    {mindmapData && (
-                      <div style={styles.mindmapContainer}>
-                        <Tree
-                          data={mindmapData}
-                          orientation="vertical"
-                          translate={{ x: 400, y: 50 }}
-                          pathFunc="diagonal"
-                          separation={{ siblings: 1.5, nonSiblings: 2 }}
-                          nodeSize={{ x: 300, y: 100 }}
-                        />
-                      </div>
-                    )}
-                  </div>
-                  {/* 保存するボタン（編集後の内容で保存するためのモーダルを表示） */}
-                  <button
-                    style={styles.actionButton}
-                    onClick={() => setShowSaveModal(true)}
+                <Typography
+                  variant="h5"
+                  sx={{
+                    fontWeight: 'bold',
+                    color: 'primary.main',
+                    textAlign: 'center',
+                    mb: 4,
+                  }}
+                >
+                  {selectedMinute.title}
+                </Typography>
+
+                {/* 整形された文字起こし */}
+                <Paper sx={{ p: 3, mb: 3, position: 'relative', borderRadius: 3 }}>
+                  <Typography
+                    variant="subtitle1"
+                    sx={{
+                      fontWeight: 'bold',
+                      color: 'secondary.main',
+                      mb: 2,
+                      fontSize: '1.2rem',
+                    }}
                   >
-                    確認画面へ
-                  </button>
-                </div>
-              )}
-              {/* 議事録保存用モーダル（確認用） */}
-              {showSaveModal && (
-                <div style={styles.modalOverlay}>
-                  <div style={styles.modalContent}>
-                    <h2 style={styles.modalTitle}>この内容で保存します</h2>
-                    <div style={styles.modalSection}>
-                      <h3 style={styles.modalSubTitle}>タイトル</h3>
-                      <p style={styles.modalText}>{title}</p>
-                    </div>
-                    <div style={styles.modalSection}>
-                      <h3 style={styles.modalSubTitle}>整形された文字起こし</h3>
-                      <p style={styles.modalText}>{notes}</p>
-                    </div>
-                    <div style={styles.modalSection}>
-                      <h3 style={styles.modalSubTitle}>議事録・改善案</h3>
-                      <p style={styles.modalText}>{summary}</p>
-                    </div>
-                    {mindmapData && (
-                      <div style={styles.modalSection}>
-                        <h3 style={styles.modalSubTitle}>マインドマップ</h3>
-                        <div style={styles.mindmapModalContainer}>
-                          <Tree
-                            data={mindmapData}
-                            orientation="vertical"
-                            translate={{ x: 350, y: 50 }}
-                            pathFunc="diagonal"
-                            separation={{ siblings: 1.5, nonSiblings: 2 }}
-                            nodeSize={{ x: 300, y: 100 }}
-                          />
-                        </div>
-                      </div>
-                    )}
-                    <button
-                      style={styles.modalActionButton}
-                      onClick={saveToDatabase}
+                    整形された文字起こし
+                  </Typography>
+                  <IconButton
+                    size="small"
+                    sx={{ position: 'absolute', top: 8, right: 8 }}
+                    onClick={() => handleCopyContent(selectedMinute.formatted_transcript)}
+                  >
+                    <ContentCopyIcon fontSize="small" />
+                  </IconButton>
+                  <Typography
+                    variant="body1"
+                    sx={{
+                      fontSize: '1.1rem',
+                      fontWeight: 'bold',
+                      lineHeight: 1.6,
+                    }}
+                  >
+                    {selectedMinute.formatted_transcript}
+                  </Typography>
+                </Paper>
+
+                {/* 議事録・改善案 */}
+                <Paper sx={{ p: 3, mb: 3, position: 'relative', borderRadius: 3 }}>
+                  <Typography
+                    variant="subtitle1"
+                    sx={{
+                      fontWeight: 'bold',
+                      color: 'secondary.main',
+                      mb: 2,
+                      fontSize: '1.2rem',
+                    }}
+                  >
+                    議事録・改善案
+                  </Typography>
+                  <IconButton
+                    size="small"
+                    sx={{ position: 'absolute', top: 8, right: 8 }}
+                    onClick={() => handleCopyContent(selectedMinute.analysis)}
+                  >
+                    <ContentCopyIcon fontSize="small" />
+                  </IconButton>
+                  <Typography
+                    variant="body1"
+                    sx={{
+                      fontSize: '1.1rem',
+                      fontWeight: 'bold',
+                      lineHeight: 1.6,
+                    }}
+                  >
+                    {selectedMinute.analysis}
+                  </Typography>
+                </Paper>
+
+                {/* マインドマップ */}
+                {selectedMinute.mindmap && (
+                  <Paper sx={{ p: 3, mb: 3, borderRadius: 3 }}>
+                    <Typography
+                      variant="subtitle1"
+                      sx={{
+                        fontWeight: 'bold',
+                        color: 'secondary.main',
+                        mb: 2,
+                        fontSize: '1.2rem',
+                      }}
                     >
-                      この内容で保存する
-                    </button>
-                    <button
-                      style={styles.modalCloseButton}
-                      onClick={() => setShowSaveModal(false)}
+                      マインドマップ
+                    </Typography>
+                    <Box
+                      sx={{
+                        border: '1px solid #ccc',
+                        borderRadius: 2,
+                        height: '600px',
+                        overflow: 'auto',
+                      }}
                     >
-                      閉じる
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-        </main>
-      </div>
-      {/* ローディングモーダル */}
-      {loading && (
-        <div style={styles.modalOverlay}>
-          <div style={styles.modalContent}>
-            <p style={styles.modalText}>議事録を生成中です...お待ちください</p>
-          </div>
-        </div>
-      )}
-      {/* 保存結果モーダル */}
-      {saveStatus && (
-        <div style={styles.modalOverlay}>
-          <div style={styles.modalContent}>
-            <p style={styles.modalText}>{saveStatus}</p>
-            <button style={styles.modalCloseButton} onClick={closeSaveModal}>
+                      <Tree
+                        data={selectedMinute.mindmap}
+                        orientation="vertical"
+                        pathFunc="diagonal"
+                        translate={{ x: 400, y: 50 }}
+                        separation={{ siblings: 1.5, nonSiblings: 2 }}
+                        nodeSize={{ x: 300, y: 100 }}
+                      />
+                    </Box>
+                  </Paper>
+                )}
+
+                <Box sx={{ display: 'flex', justifyContent: 'center' }}>
+                  <Button
+                    variant="contained"
+                    color="error"
+                    onClick={() => deleteMinutes(selectedMinute.id)}
+                    sx={{
+                      borderRadius: 3,
+                      px: 4,
+                      py: 1,
+                      fontWeight: 'bold',
+                    }}
+                  >
+                    この議事録を削除
+                  </Button>
+                </Box>
+              </motion.div>
+            ) : (
+              <motion.div
+                key={mode}
+                variants={fadeInVariants}
+                initial="hidden"
+                animate="visible"
+                exit={{ opacity: 0 }}
+              >
+                {mode === "audio" && (
+                  <Paper sx={{ p: 4, mb: 4, borderRadius: 3 }} elevation={3}>
+                    <Typography
+                      variant="h5"
+                      sx={{
+                        textAlign: 'center',
+                        mb: 3,
+                        color: 'primary.main',
+                        fontWeight: 'bold',
+                      }}
+                    >
+                      音声モード
+                    </Typography>
+                    <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}>
+                      {!recording ? (
+                        <Button
+                          variant="contained"
+                          color="primary"
+                          onClick={startRecording}
+                          sx={{ borderRadius: 3, px: 4, py: 1, fontWeight: 'bold' }}
+                        >
+                          録音開始
+                        </Button>
+                      ) : (
+                        <Button
+                          variant="contained"
+                          color="secondary"
+                          onClick={stopRecording}
+                          sx={{ borderRadius: 3, px: 4, py: 1, fontWeight: 'bold' }}
+                        >
+                          録音停止
+                        </Button>
+                      )}
+                      {recording && (
+                        <Typography variant="body1" sx={{ mt: 1, fontWeight: 'bold', fontSize: '1rem' }}>
+                          録音中... {Math.floor(recordingDuration / 60)}分 {recordingDuration % 60}秒
+                        </Typography>
+                      )}
+                    </Box>
+                  </Paper>
+                )}
+
+                {mode === "text" && (
+                  <Paper sx={{ p: 4, mb: 4, borderRadius: 3 }} elevation={3}>
+                    <Typography
+                      variant="h5"
+                      sx={{
+                        textAlign: 'center',
+                        mb: 3,
+                        color: 'primary.main',
+                        fontWeight: 'bold',
+                      }}
+                    >
+                      テキストモード
+                    </Typography>
+                    <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 2 }}>
+                      <TextField
+                        fullWidth
+                        multiline
+                        rows={4}
+                        variant="outlined"
+                        size="small"
+                        sx={{ maxWidth: '600px', fontSize: '1.1rem', fontWeight: 'bold', borderRadius: 2 }}
+                        value={inputTranscript}
+                        onChange={(e) => setInputTranscript(e.target.value)}
+                        placeholder="ここにテキストを貼り付けてください"
+                      />
+                      <Button
+                        variant="contained"
+                        color="primary"
+                        onClick={sendTextToServer}
+                        sx={{ borderRadius: 3, px: 4, py: 1, fontWeight: 'bold' }}
+                      >
+                        議事録生成
+                      </Button>
+                    </Box>
+                  </Paper>
+                )}
+
+                {mode === "chat" && (
+                  <Paper sx={{ p: 4, mb: 4, borderRadius: 3 }} elevation={3}>
+                    <Typography
+                      variant="h5"
+                      sx={{
+                        textAlign: 'center',
+                        mb: 3,
+                        color: 'primary.main',
+                        fontWeight: 'bold',
+                      }}
+                    >
+                      チャットモード (GPT風UI)
+                    </Typography>
+
+                    {/* GPT風チャットエリア */}
+                    <Box
+                      sx={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        height: '500px',
+                        maxWidth: '700px',
+                        margin: '0 auto',
+                        border: '1px solid #ccc',
+                        borderRadius: 3,
+                        overflow: 'hidden',
+                      }}
+                    >
+                      {/* メッセージ表示エリア */}
+                      <Box
+                        sx={{
+                          flex: 1,
+                          overflowY: 'auto',
+                          p: 2,
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: 1,
+                          backgroundColor: '#fdfdfd',
+                        }}
+                      >
+                        {chatMessages.map((msg, idx) => (
+                          <Box
+                            key={idx}
+                            sx={{
+                              alignSelf: msg.sender === 'user' ? 'flex-end' : 'flex-start',
+                              maxWidth: '80%',
+                            }}
+                          >
+                            <Paper
+                              sx={{
+                                p: 1.5,
+                                my: 0.5,
+                                borderRadius: 2,
+                                backgroundColor: msg.sender === 'user' ? '#e3f2fd' : '#ffffff',
+                                boxShadow: 2,
+                              }}
+                            >
+                              <Typography variant="body1" sx={{ whiteSpace: 'pre-wrap', fontSize: '1rem' }}>
+                                {msg.text}
+                              </Typography>
+                            </Paper>
+                          </Box>
+                        ))}
+                      </Box>
+
+                      {/* 入力部 */}
+                      <Box
+                        sx={{
+                          borderTop: '1px solid #ccc',
+                          p: 2,
+                          display: 'flex',
+                          gap: 1,
+                          backgroundColor: '#f0f0f0',
+                        }}
+                      >
+                        <TextField
+                          variant="outlined"
+                          size="small"
+                          fullWidth
+                          value={chatInput}
+                          onChange={(e) => setChatInput(e.target.value)}
+                          placeholder="質問を入力...(Enterで改行。送信はボタン)"
+                          sx={{ borderRadius: 2 }}
+                          multiline
+                          rows={2}
+                        />
+                        <Button
+                          variant="contained"
+                          onClick={sendChatMessage}
+                          sx={{ borderRadius: 3, px: 2, py: 1, fontWeight: 'bold', alignSelf: 'end' }}
+                        >
+                          送信
+                        </Button>
+                      </Box>
+                    </Box>
+                  </Paper>
+                )}
+
+                {/* 生成結果 (audio/text時) */}
+                {(recorded && notes && (mode === "audio" || mode === "text")) && (
+                  <motion.div
+                    key="generatedView"
+                    variants={popInVariants}
+                    initial="hidden"
+                    animate="visible"
+                    exit={{ opacity: 0 }}
+                  >
+                    <Paper sx={{ p: 4, mb: 4, borderRadius: 3 }} elevation={2}>
+                      <Typography
+                        variant="h5"
+                        sx={{
+                          mb: 3,
+                          color: 'primary.main',
+                          fontWeight: 'bold',
+                          textAlign: 'center',
+                        }}
+                      >
+                        生成された議事録（編集可能）
+                      </Typography>
+
+                      <Box sx={{ position: 'relative', mb: 3 }}>
+                        <Typography variant="subtitle2" sx={{ fontWeight: 'bold', mb: 1, fontSize: '1.2rem' }}>
+                          タイトル:
+                        </Typography>
+                        <IconButton
+                          size="small"
+                          sx={{ position: 'absolute', top: 30, right: 10 }}
+                          onClick={() => handleCopyContent(title)}
+                        >
+                          <ContentCopyIcon fontSize="small" />
+                        </IconButton>
+                        <TextField
+                          fullWidth
+                          variant="outlined"
+                          size="small"
+                          sx={{ mt: 1 }}
+                          value={title}
+                          onChange={(e) => setTitle(e.target.value)}
+                        />
+                      </Box>
+
+                      <Box sx={{ position: 'relative', mb: 3 }}>
+                        <Typography variant="subtitle2" sx={{ fontWeight: 'bold', mb: 1, fontSize: '1.2rem' }}>
+                          文字起こし:
+                        </Typography>
+                        <IconButton
+                          size="small"
+                          sx={{ position: 'absolute', top: 30, right: 10 }}
+                          onClick={() => handleCopyContent(notes)}
+                        >
+                          <ContentCopyIcon fontSize="small" />
+                        </IconButton>
+                        <TextField
+                          fullWidth
+                          multiline
+                          rows={4}
+                          variant="outlined"
+                          size="small"
+                          sx={{ mt: 1 }}
+                          value={notes}
+                          onChange={(e) => setNotes(e.target.value)}
+                        />
+                      </Box>
+
+                      <Box sx={{ position: 'relative', mb: 3 }}>
+                        <Typography variant="subtitle2" sx={{ fontWeight: 'bold', mb: 1, fontSize: '1.2rem' }}>
+                          議事録・改善案:
+                        </Typography>
+                        <IconButton
+                          size="small"
+                          sx={{ position: 'absolute', top: 30, right: 10 }}
+                          onClick={() => handleCopyContent(summary)}
+                        >
+                          <ContentCopyIcon fontSize="small" />
+                        </IconButton>
+                        <TextField
+                          fullWidth
+                          multiline
+                          rows={4}
+                          variant="outlined"
+                          size="small"
+                          sx={{ mt: 1 }}
+                          value={summary}
+                          onChange={(e) => setSummary(e.target.value)}
+                        />
+                      </Box>
+
+                      <Box sx={{ display: 'flex', justifyContent: 'center', mt: 3 }}>
+                        <Button
+                          variant="contained"
+                          onClick={() => setShowSaveModal(true)}
+                          sx={{ borderRadius: 3, px: 4, py: 1, fontWeight: 'bold' }}
+                        >
+                          確認画面へ
+                        </Button>
+                      </Box>
+                    </Paper>
+                  </motion.div>
+                )}
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </Box>
+
+        {/* 保存モーダル */}
+        <Dialog open={showSaveModal} onClose={() => setShowSaveModal(false)} fullWidth maxWidth="md">
+          <DialogTitle>この内容で保存します</DialogTitle>
+          <DialogContent dividers>
+            <DialogContentText>
+              <strong>タイトル:</strong> {title}
+            </DialogContentText>
+            <DialogContentText>
+              <strong>文字起こし:</strong> {notes}
+            </DialogContentText>
+            <DialogContentText>
+              <strong>議事録・改善案:</strong> {summary}
+            </DialogContentText>
+            {mindmapData && (
+              <Box sx={{ border: '1px solid #ccc', p: 2, borderRadius: 2, mt: 2 }}>
+                <Tree
+                  data={mindmapData}
+                  orientation="vertical"
+                  translate={{ x: 350, y: 50 }}
+                  pathFunc="diagonal"
+                  separation={{ siblings: 1.5, nonSiblings: 2 }}
+                  nodeSize={{ x: 300, y: 100 }}
+                />
+              </Box>
+            )}
+          </DialogContent>
+          <DialogActions sx={{ justifyContent: 'center' }}>
+            <Button
+              onClick={saveToDatabase}
+              variant="contained"
+              sx={{ borderRadius: 3, px: 4, py: 1, fontWeight: 'bold' }}
+            >
+              この内容で保存する
+            </Button>
+            <Button
+              onClick={() => setShowSaveModal(false)}
+              variant="outlined"
+              sx={{ borderRadius: 3, px: 4, py: 1, fontWeight: 'bold' }}
+            >
               閉じる
-            </button>
-          </div>
-        </div>
-      )}
-    </div>
+            </Button>
+          </DialogActions>
+        </Dialog>
+
+        {/* ローディング */}
+        <Dialog open={loading} maxWidth="xs">
+          <DialogContent sx={{ textAlign: 'center' }}>
+            <CircularProgress />
+            <DialogContentText sx={{ mt: 2 }}>
+              議事録を生成中です...お待ちください
+            </DialogContentText>
+          </DialogContent>
+        </Dialog>
+
+        {/* 保存結果モーダル */}
+        <Dialog open={Boolean(saveStatus)} onClose={closeSaveModal} maxWidth="xs">
+          <DialogContent>
+            <DialogContentText>{saveStatus}</DialogContentText>
+          </DialogContent>
+          <DialogActions sx={{ justifyContent: 'center' }}>
+            <Button
+              onClick={closeSaveModal}
+              variant="contained"
+              sx={{ borderRadius: 3, px: 4, py: 1, fontWeight: 'bold' }}
+            >
+              閉じる
+            </Button>
+          </DialogActions>
+        </Dialog>
+      </Box>
+    </ThemeProvider>
   );
 }
-
-// --------------------------
-// スタイル定義
-// --------------------------
-const styles = {
-  appContainer: {
-    backgroundColor: '#fff',
-    minHeight: '100vh',
-    fontFamily: '"Montserrat", "Playfair Display", sans-serif',
-    color: '#333',
-    padding: '20px',
-    transition: 'all 0.3s ease',
-  },
-  header: {
-    display: 'flex',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    backgroundColor: '#fff',
-    padding: '10px 20px',
-    borderBottom: '1px solid #ddd',
-    position: 'sticky',
-    top: 0,
-    zIndex: 10,
-  },
-  headerLeft: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '15px',
-  },
-  toggleButton: {
-    backgroundColor: '#4facfe',
-    border: 'none',
-    borderRadius: '50%',
-    width: '36px',
-    height: '36px',
-    color: '#fff',
-    fontSize: '1.2rem',
-    cursor: 'pointer',
-    transition: 'background 0.3s ease',
-  },
-  logo: {
-    fontSize: '1.8rem',
-    margin: 0,
-    fontWeight: 'bold',
-  },
-  headerRight: {
-    display: 'flex',
-    gap: '10px',
-  },
-  contentWrapper: {
-    display: 'flex',
-    position: 'relative',
-    transition: 'all 0.3s ease',
-  },
-  sidebar: {
-    width: '280px',
-    backgroundColor: '#f7f7f7',
-    padding: '20px',
-    height: 'calc(100vh - 60px)',
-    overflowY: 'auto',
-    borderRight: '1px solid #eee',
-    position: 'fixed',
-    left: 0,
-    top: 60,
-    bottom: 0,
-    transition: 'transform 0.3s ease',
-  },
-  sidebarTitle: {
-    fontSize: '1.4rem',
-    marginBottom: '15px',
-    fontWeight: 'bold',
-  },
-  sidebarItem: {
-    padding: '10px',
-    borderBottom: '1px solid #ddd',
-    cursor: 'pointer',
-    transition: 'background 0.3s ease',
-  },
-  sidebarText: {
-    fontSize: '0.9rem',
-    color: '#666',
-  },
-  mainContent: {
-    marginLeft: 300,
-    padding: '20px',
-    width: '100%',
-    transition: 'margin-left 0.3s ease',
-  },
-  recorderContainer: {
-    padding: '20px',
-  },
-  descriptionBox: {
-    marginBottom: '30px',
-    animation: 'fadeIn 0.5s ease',
-  },
-  descriptionText: {
-    fontSize: '1.1rem',
-    lineHeight: '1.6',
-  },
-  controlsWrapper: {
-    display: 'flex',
-    justifyContent: 'center',
-    gap: '20px',
-    animation: 'fadeIn 0.5s ease',
-  },
-  actionButton: {
-    background: 'linear-gradient(45deg, #4facfe, #00f2fe)',
-    border: 'none',
-    padding: '15px 30px',
-    borderRadius: '30px',
-    cursor: 'pointer',
-    fontSize: '1.3rem',
-    color: '#fff',
-    transition: 'transform 0.2s ease, background 0.3s ease',
-  },
-  generatedContainer: {
-    marginTop: '30px',
-    animation: 'fadeIn 0.5s ease',
-    display: 'flex',
-    flexDirection: 'column',
-    alignItems: 'center',
-    gap: '20px',
-  },
-  generatedContent: {
-    width: '100%',
-  },
-  // 編集可能な入力欄用スタイル
-  editableTitle: {
-    width: '100%',
-    padding: '10px 15px',
-    fontSize: '1.2rem',
-    borderRadius: '5px',
-    border: '1px solid #ccc',
-    marginTop: '5px',
-  },
-  editableTextarea: {
-    width: '100%',
-    padding: '10px 15px',
-    fontSize: '1rem',
-    borderRadius: '5px',
-    border: '1px solid #ccc',
-    minHeight: '100px',
-    marginTop: '5px',
-    resize: 'vertical',
-  },
-  modalOverlay: {
-    position: 'fixed',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    backgroundColor: 'rgba(0,0,0,0.4)',
-    display: 'flex',
-    justifyContent: 'center',
-    alignItems: 'center',
-    zIndex: 1000,
-    animation: 'fadeIn 0.3s ease',
-  },
-  modalContent: {
-    backgroundColor: '#fff',
-    padding: '30px',
-    borderRadius: '10px',
-    width: '80%',
-    height: '80%',
-    maxWidth: '900px',
-    textAlign: 'left',
-    boxShadow: '0 2px 10px rgba(0,0,0,0.1)',
-    animation: 'slideDown 0.4s ease, popIn 0.4s ease',
-    display: 'flex',
-    flexDirection: 'column',
-    overflowY: 'auto',
-    boxSizing: 'border-box',
-  },
-  modalTitle: {
-    fontSize: '1.8rem',
-    marginBottom: '20px',
-    textAlign: 'center',
-    fontWeight: 'bold',
-    flexShrink: 0,
-  },
-  titleInput: {
-    width: '100%',
-    padding: '12px 20px',
-    marginBottom: '20px',
-    borderRadius: '30px',
-    border: '1px solid #ccc',
-    fontSize: '1rem',
-    outline: 'none',
-    transition: 'border-color 0.3s ease',
-    boxSizing: 'border-box',
-  },
-  modalSection: {
-    marginBottom: '20px',
-    flexShrink: 0,
-  },
-  modalSubTitle: {
-    fontSize: '1.3rem',
-    marginBottom: '10px',
-    fontWeight: 'bold',
-  },
-  modalText: {
-    fontSize: '1rem',
-    lineHeight: 1.6,
-  },
-  mindmapModalContainer: {
-    width: '100%',
-    minHeight: '300px',
-    border: '1px solid #eee',
-    borderRadius: '8px',
-    position: 'relative',
-    overflow: 'auto',
-    height: '300px',
-    backgroundColor: '#fafafa',
-  },
-  modalActionButton: {
-    background: 'linear-gradient(45deg, #4facfe, #00f2fe)',
-    border: 'none',
-    padding: '12px 25px',
-    borderRadius: '30px',
-    cursor: 'pointer',
-    fontSize: '1.1rem',
-    color: '#fff',
-    width: '100%',
-    marginBottom: '10px',
-    transition: 'background 0.3s ease, transform 0.2s ease',
-    flexShrink: 0,
-  },
-  modalCloseButton: {
-    backgroundColor: '#ccc',
-    border: 'none',
-    padding: '12px 25px',
-    borderRadius: '30px',
-    cursor: 'pointer',
-    fontSize: '1rem',
-    color: '#333',
-    width: '100%',
-    transition: 'background 0.3s ease, transform 0.2s ease',
-    flexShrink: 0,
-  },
-  detailContainer: {
-    animation: 'fadeIn 0.3s ease',
-  },
-  detailTitle: {
-    fontSize: '1.8rem',
-    fontWeight: 'bold',
-    marginBottom: '20px',
-  },
-  card: {
-    backgroundColor: '#fff',
-    padding: '20px',
-    borderRadius: '8px',
-    margin: '10px 0',
-    boxShadow: '0 2px 8px rgba(0,0,0,0.05)',
-  },
-  cardTitle: {
-    fontSize: '1.3rem',
-    marginBottom: '10px',
-    fontWeight: 'bold',
-  },
-  cardContent: {
-    fontSize: '1rem',
-    lineHeight: '1.6',
-  },
-  mindmapContainer: {
-    height: '400px',
-    overflow: 'auto',
-    marginTop: '20px',
-    border: '1px solid #eee',
-    borderRadius: '8px',
-    backgroundColor: '#fafafa',
-  },
-  backButton: {
-    backgroundColor: '#4facfe',
-    border: 'none',
-    padding: '10px 20px',
-    borderRadius: '30px',
-    cursor: 'pointer',
-    fontSize: '1rem',
-    color: '#fff',
-    marginBottom: '20px',
-    transition: 'background 0.3s ease',
-  },
-};
 
 export default App;
