@@ -79,7 +79,7 @@ function CustomColoredLink({ linkDatum, orientation }) {
 }
 
 function App() {
-  const API_URL = "http://localhost:8000";
+  const API_URL = "http://15.168.142.62:8000";
 
   // --------------------------
   // ステート類（議事録表示・生成）
@@ -563,7 +563,7 @@ function App() {
                       fontSize: '1.2rem',
                     }}
                   >
-                    整形された文字起こし
+                    文字起こし
                   </Typography>
                   <IconButton
                     size="small"
@@ -589,7 +589,7 @@ function App() {
                       fontSize: '1.2rem',
                     }}
                   >
-                    議事録・改善案
+                    議事録
                   </Typography>
                   <IconButton
                     size="small"
@@ -775,7 +775,7 @@ function App() {
                         sx={{ maxWidth: '600px', fontSize: '1.1rem', fontWeight: 'bold', borderRadius: 2 }}
                         value={inputTranscript}
                         onChange={(e) => setInputTranscript(e.target.value)}
-                        placeholder="ここにテキストを貼り付けてください"
+                        placeholder="ここにオンライン会議の文字起こしを貼り付けてください"
                       />
                       <Button
                         variant="contained"
@@ -925,7 +925,7 @@ function App() {
                           fullWidth
                           value={chatInput}
                           onChange={(e) => setChatInput(e.target.value)}
-                          placeholder="質問を入力...(Enterで改行。送信はボタン)"
+                          placeholder="過去の議事録に関する質問を入力..."
                           sx={{ borderRadius: 2 }}
                           multiline
                           rows={2}
@@ -955,7 +955,7 @@ function App() {
               <strong>文字起こし:</strong> {notes}
             </DialogContentText>
             <DialogContentText sx={{ whiteSpace: "pre-wrap" }}>
-              <strong>議事録・改善案:</strong> {summary}
+              <strong>議事録:</strong> {summary}
             </DialogContentText>
           </DialogContent>
           <DialogActions sx={{ justifyContent: 'center' }}>
